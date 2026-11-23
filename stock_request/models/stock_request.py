@@ -3,7 +3,7 @@
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.tools import float_compare
+from odoo.tools import float_compare, float_is_zero
 
 
 class StockRequest(models.Model):
@@ -124,10 +124,18 @@ class StockRequest(models.Model):
                 )
 
     def _get_all_origin_moves(self, move):
-        all_moves = move
-        if move.move_orig_ids:
-            for orig_move in move.move_orig_ids:
-                all_moves |= self._get_all_origin_moves(orig_move)
+        # Collect the move and all its transitive origin moves. The traversal
+        # is iterative and keeps track of the moves already visited because
+        # ``move_orig_ids`` can form a cyclic graph (e.g. returning both legs
+        # of a two-step inter-warehouse transfer that share a transit
+        # location links each leg's return to the other). A naive recursion
+        # over such a cycle raises RecursionError.
+        all_moves = self.env["stock.move"]
+        moves_to_visit = move
+        while moves_to_visit:
+            moves_to_visit -= all_moves
+            all_moves |= moves_to_visit
+            moves_to_visit = moves_to_visit.move_orig_ids
         return all_moves
 
     @api.depends("allocation_ids", "allocation_ids.stock_move_id")
@@ -155,6 +163,8 @@ class StockRequest(models.Model):
 
     @api.depends(
         "allocation_ids",
+        "allocation_ids.requested_product_uom_qty",
+        "allocation_ids.allocated_product_qty",
         "allocation_ids.stock_move_id.state",
         "allocation_ids.stock_move_id.move_line_ids",
         "allocation_ids.stock_move_id.move_line_ids.quantity",
@@ -285,7 +295,7 @@ class StockRequest(models.Model):
     def check_cancel(self):
         for request in self:
             if request._check_cancel_allocation():
-                request.write({"state": "cancel"})
+                request._action_done_or_cancel()
 
     def check_done(self):
         precision = self.env["decimal.precision"].precision_get(
@@ -304,9 +314,18 @@ class StockRequest(models.Model):
             ):
                 request.action_done()
             elif request._check_cancel_allocation():
-                # If qty_done=0 and qty_cancelled>0 it's cancelled
-                request.write({"state": "cancel"})
+                request._action_done_or_cancel()
         return True
+
+    def _action_done_or_cancel(self):
+        precision = self.env["decimal.precision"].precision_get(
+            "Product Unit of Measure"
+        )
+        self.ensure_one()
+        if float_compare(self.qty_done, 0, precision_digits=precision) > 0:
+            self.action_done()
+        else:
+            self.write({"state": "cancel"})
 
     def _check_cancel_allocation(self):
         precision = self.env["decimal.precision"].precision_get(
@@ -316,6 +335,7 @@ class StockRequest(models.Model):
         return (
             self.allocation_ids
             and float_compare(self.qty_cancelled, 0, precision_digits=precision) > 0
+            and float_is_zero(self.qty_in_progress, precision_digits=precision)
         )
 
     def _prepare_procurement_values(self, group_id=False):
@@ -354,7 +374,9 @@ class StockRequest(models.Model):
         return {
             "stock_request_id": self.id,
             "stock_move_id": move.id,
-            "requested_product_uom_qty": move.product_uom_qty,
+            "requested_product_uom_qty": move.product_uom._compute_quantity(
+                move.product_uom_qty, self.product_uom_id, round=False
+            ),
         }
 
     def _action_use_stock_available(self):
@@ -365,7 +387,7 @@ class StockRequest(models.Model):
             "Product Unit of Measure"
         )
         quants = self.env["stock.quant"]._gather(self.product_id, self.location_id)
-        pending_qty = self.product_uom_qty
+        pending_qty = self.product_qty
         for quant in quants.filtered(lambda x: x.available_quantity >= 0):
             qty_move = min(pending_qty, quant.available_quantity)
             if float_compare(qty_move, 0, precision_digits=precision) > 0:
@@ -407,7 +429,7 @@ class StockRequest(models.Model):
                         request.product_id.sudo()
                         .with_context(location=request.location_id.id)
                         .free_qty,
-                        request.product_uom_qty,
+                        request.product_qty,
                         precision_digits=precision,
                     )
                     >= 0
